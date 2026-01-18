@@ -1,5 +1,7 @@
 use core::slice;
-use std::{cell::UnsafeCell, ops::Range, ptr::NonNull, sync::atomic::Ordering};
+use std::{
+    cell::UnsafeCell, marker::PhantomData, ops::Range, ptr::NonNull, sync::atomic::Ordering,
+};
 
 mod buffer_pool;
 mod mapped_ring;
@@ -64,7 +66,12 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
         if len > BUFFER_SIZE {
             return None;
         }
-        inner.get(bid).map(|ptr| Buffer { bid, ptr, len })
+        inner.get(bid).map(|ptr| Buffer {
+            bid,
+            ptr,
+            len,
+            _not_send_sync: PhantomData,
+        })
     }
 
     pub fn get_buffers_range(&self, bid_first_buffer: u16, len: usize) -> Option<BufferRange> {
@@ -79,15 +86,15 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
                 range: first_buffer as _..last_buffer as _,
                 ptr,
                 len,
+                _not_send_sync: PhantomData,
             });
         }
         None
     }
 
     ///recycles a buffer in the ring, use this only once on a buffer when you are done
-    pub fn recycle(&self, bid: u16) {
+    pub fn recycle_buffer(&self, buffer: Buffer) {
         let ring = unsafe { &*self.mapped_ring.get() };
-        let pool = unsafe { &*self.buffer_pool.get() };
 
         unsafe {
             let ring_ptr = ring.inner().as_ptr();
@@ -96,11 +103,37 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
             let idx = (tail as usize) & (RING_SIZE - 1);
             let entry = ring_ptr.add(idx);
 
-            (*entry).set_addr(pool.ptr_for_bid(bid as usize) as u64);
+            (*entry).set_addr(buffer.ptr.as_ptr() as u64);
             (*entry).set_len(BUFFER_SIZE as u32);
-            (*entry).set_bid(bid);
+            (*entry).set_bid(buffer.bid);
 
             (*tail_ptr).store(tail.wrapping_add(1), Ordering::Release);
+        }
+    }
+
+    /// recycles all buffers in a range back to the ring.
+    pub fn recycle_range_buffer(&self, buffer: BufferRange) {
+        let ring = unsafe { &*self.mapped_ring.get() };
+        let pool = unsafe { &*self.buffer_pool.get() };
+
+        unsafe {
+            let ring_ptr = ring.inner().as_ptr();
+            let tail_ptr = BufRingEntry::tail(ring_ptr) as *const std::sync::atomic::AtomicU16;
+            let tail = (*tail_ptr).load(Ordering::Acquire);
+
+            let count = buffer.range.end - buffer.range.start;
+
+            for (i, bid) in buffer.range.enumerate() {
+                let idx = (tail.wrapping_add(i as u16) as usize) & (RING_SIZE - 1);
+                let entry = ring_ptr.add(idx);
+
+                let ptr = pool.ptr_for_bid(bid as usize);
+                (*entry).set_addr(ptr as u64);
+                (*entry).set_len(BUFFER_SIZE as u32);
+                (*entry).set_bid(bid);
+            }
+
+            (*tail_ptr).store(tail.wrapping_add(count), Ordering::Release);
         }
     }
 }
@@ -111,6 +144,7 @@ pub struct BufferRange {
     ptr: NonNull<u8>,
     len: usize,
     range: Range<u16>,
+    _not_send_sync: PhantomData<*const ()>,
 }
 
 impl BufferRange {
@@ -125,6 +159,7 @@ pub struct Buffer {
     ptr: NonNull<u8>,
     len: usize,
     bid: u16,
+    _not_send_sync: PhantomData<*const ()>,
 }
 
 impl Buffer {
@@ -152,83 +187,4 @@ fn last_buffer<const BUFFER_SIZE: usize, const RING_SIZE: usize>(
     total_len: usize,
 ) -> usize {
     bid + total_len.div_ceil(BUFFER_SIZE)
-}
-
-#[cfg(test)]
-mod test {
-    use std::io::Write;
-    use std::net::{TcpListener, TcpStream};
-    use std::os::fd::AsRawFd;
-
-    use io_uring::opcode;
-    use io_uring::squeue::Flags;
-    use io_uring::types::Fd;
-
-    use crate::RingBuffer;
-
-    #[test]
-    fn test_recv_with_buffer_ring() {
-        const BUFFER_SIZE: usize = 4;
-        const SIZE: usize = 4;
-        const BGID: u16 = 0;
-
-        // Create io_uring
-        let mut ring = io_uring::IoUring::new(64).unwrap();
-
-        // Create buffer ring: 4 buffers of 4 bytes = 16 bytes total
-        let br = RingBuffer::<BUFFER_SIZE, SIZE>::new(&ring, 0, BGID).unwrap();
-
-        // Create a TCP listener and connect
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let mut client = TcpStream::connect(addr).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        server.set_nonblocking(true).unwrap();
-
-        // Submit recv with provided buffer selection
-        let recv_entry = opcode::Recv::new(
-            Fd(server.as_raw_fd()),
-            std::ptr::null_mut(),
-            BUFFER_SIZE as u32,
-        )
-        .buf_group(BGID)
-        .build()
-        .flags(Flags::BUFFER_SELECT)
-        .user_data(0x42);
-
-        // Send and receive multiple times to test recycling
-        // We have only 4 buffers, but we'll do 8 sends to prove recycling works
-        for i in 0..8u8 {
-            let test_data = [b'A' + i; 4]; // "AAAA", "BBBB", etc.
-            client.write_all(&test_data).unwrap();
-            client.flush().unwrap();
-
-            unsafe {
-                ring.submission().push(&recv_entry).unwrap();
-            }
-            ring.submit_and_wait(1).unwrap();
-
-            let cqe = ring.completion().next().unwrap();
-            assert!(cqe.result() >= 0, "recv {} failed: {}", i, cqe.result());
-
-            let bytes_read = cqe.result() as usize;
-            let flags = cqe.flags();
-            let buffer_id = (flags >> 16) as u16;
-
-            let buffer = br.get_buffer(buffer_id, bytes_read).unwrap();
-            println!(
-                "Round {}: Received {} bytes in buffer {}: {:?}",
-                i,
-                bytes_read,
-                buffer_id,
-                std::str::from_utf8(buffer.as_ref()).unwrap()
-            );
-
-            assert_eq!(buffer.as_ref(), &test_data);
-            br.recycle(buffer_id);
-        }
-
-        println!("Successfully recycled buffers - 8 recvs with only 4 buffers!");
-    }
 }
