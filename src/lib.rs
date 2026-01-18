@@ -14,8 +14,6 @@ pub struct RingBuffer<const BUFFER_SIZE: usize, const RING_SIZE: usize> {
     id: u16,
 }
 
-// No custom Drop needed - kernel cleans up when io_uring fd is closed
-
 impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, RING_SIZE> {
     pub fn group_id(&self) -> u16 {
         self.id
@@ -86,9 +84,8 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
         None
     }
 
-    /// Recycle a single buffer back into the ring
+    ///recycles a buffer in the ring, use this only once on a buffer when you are done
     pub fn recycle(&self, bid: u16) {
-        println!("freed");
         let ring = unsafe { &*self.mapped_ring.get() };
         let pool = unsafe { &*self.buffer_pool.get() };
 
