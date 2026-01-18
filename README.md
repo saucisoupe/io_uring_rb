@@ -2,5 +2,7 @@
 - works along with the io-uring crate
 
 # WIP
+- freeing from the buffer itself? Drop?
+- support for batch freeing
 - support for bundled operations (BufferRange)
 
