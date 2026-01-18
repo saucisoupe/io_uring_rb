@@ -24,10 +24,8 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
     pub fn new(ring: &IoUring, flags: u16, buffer_group_id: u16) -> std::io::Result<Self> {
         assert!(BUFFER_SIZE.is_power_of_two());
         assert!(BUFFER_SIZE <= u32::MAX as usize);
-        assert!(BUFFER_SIZE != 0);
         assert!(RING_SIZE.is_power_of_two());
         assert!(RING_SIZE <= u16::MAX as usize);
-        assert!(RING_SIZE != 0);
 
         let mut mmaped_ring: MmapedRing = MmapedRing::build(RING_SIZE as _)?;
         let slice = mmaped_ring.as_slice();
