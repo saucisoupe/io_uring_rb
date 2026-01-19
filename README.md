@@ -2,7 +2,7 @@ Ring buffer manager for io_uring in *core-per-thread architecture context*, work
 
 # conditions
 - linux
-- kernel version >= 6.10 (my code won't check)
+- kernel version >= 5.19 (my code won't check)
 - BUFFER_SIZE and RING_SIZE are compile-time and must be power-of-two
 
 # features
