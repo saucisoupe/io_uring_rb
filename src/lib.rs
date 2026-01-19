@@ -1,14 +1,20 @@
-use core::slice;
 use std::{
     cell::UnsafeCell, marker::PhantomData, ops::Range, ptr::NonNull, sync::atomic::Ordering,
 };
 
+mod buffer;
 mod buffer_pool;
+mod buffers_range;
 mod mapped_ring;
 
 use io_uring::{IoUring, types::BufRingEntry};
 
-use crate::{buffer_pool::BufferPool, mapped_ring::MmapedRing};
+use crate::{
+    buffer::Buffer,
+    buffer_pool::BufferPool,
+    buffers_range::{BufferRange, BufferRangeInner},
+    mapped_ring::MmapedRing,
+};
 
 type BufferId = u16;
 
@@ -63,7 +69,7 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
 
     fn get_pool_base(&self) -> NonNull<u8> {
         let ring_ptr = unsafe { &*self.buffer_pool.get() };
-        ring_ptr.get(0).unwrap()
+        ring_ptr.get(0).unwrap() //always exists
     }
 
     fn get_range(&self, buff_range: &BufferRangeInner) -> Range<u16> {
@@ -170,66 +176,6 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
     }
 }
 
-/// this buffer represents an immutable slice over multiple contiguous underlying buffers, recycle it when you are done. Made for Bundled Recv
-/// not automatically returned on Drop.
-#[derive(Debug)]
-pub struct BufferRange {
-    first: BufferRangeInner,
-    second: Option<BufferRangeInner>,
-    _not_send_sync: PhantomData<*const ()>,
-}
-
-#[derive(Debug)]
-pub struct BufferRangeInner {
-    ptr: NonNull<u8>,
-    len: usize,
-}
-
-/// this buffer represents an immutable slice in a buffer, recycle it when you are done.
-/// not automatically returned on Drop.
-#[derive(Debug)]
-pub struct Buffer {
-    ptr: NonNull<u8>,
-    len: usize,
-    bid: u16,
-    _not_send_sync: PhantomData<*const ()>,
-}
-
-impl Buffer {
-    pub fn bid(&self) -> u16 {
-        self.bid
-    }
-}
-
-impl AsRef<[u8]> for Buffer {
-    fn as_ref(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-    }
-}
-
-impl BufferRange {
-    #[inline]
-    pub fn as_parts<R>(&self, mut f: impl FnMut(&[u8]) -> R) -> (R, Option<R>) {
-        let r1 = f(self.first.as_slice());
-        let r2 = self.second.as_ref().map(|s| f(s.as_slice()));
-        (r1, r2)
-    }
-
-    pub fn as_iterator(&self) -> impl Iterator<Item = &u8> {
-        self.first
-            .as_slice()
-            .iter()
-            .chain(self.second.iter().flat_map(|s| s.as_slice()))
-    }
-}
-
-impl BufferRangeInner {
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-    }
-}
-
 ///gets the id of the last buffer of a range, starting at bid
 #[inline(always)]
 fn last_buffer_index<const BUFFER_SIZE: u32, const RING_SIZE: u16>(
@@ -239,6 +185,7 @@ fn last_buffer_index<const BUFFER_SIZE: u32, const RING_SIZE: u16>(
     bid + (total_len as u32).div_ceil(BUFFER_SIZE) as u16 - 1
 }
 
+///creates a range of the different buffers holding the data
 fn get_range_inner<const BUFFER_SIZE: u32, const RING_SIZE: u16>(
     base: NonNull<u8>,
     ptr: NonNull<u8>,
@@ -251,38 +198,53 @@ fn get_range_inner<const BUFFER_SIZE: u32, const RING_SIZE: u16>(
     start..end
 }
 
-#[test]
-fn last_buffer_tests() {
-    let k = last_buffer_index::<64, 64>(63, 64);
-    assert_eq!(k, 63);
-    let k = last_buffer_index::<64, 64>(0, 64);
-    assert_eq!(k, 0);
-    let k = last_buffer_index::<64, 64>(0, 25);
-    assert_eq!(k, 0);
-    let k = last_buffer_index::<64, 64>(0, 130);
-    assert_eq!(k, 2);
-}
+#[cfg(test)]
+mod tests {
+    use std::ptr::NonNull;
 
-#[test]
-fn get_range_inner_test() {
-    const LOCAL_BUFFER_SIZE: u32 = 64;
-    const LOCAL_RING_SIZE: u16 = 64;
-    let mut arr = [0u8; (LOCAL_BUFFER_SIZE * LOCAL_RING_SIZE as u32) as usize];
-    let base = unsafe { NonNull::new_unchecked(arr.as_mut_ptr()) };
-    assert_eq!(
-        3..4,
-        get_range_inner::<LOCAL_BUFFER_SIZE, LOCAL_RING_SIZE>(
-            base,
-            unsafe { base.offset(3 * LOCAL_BUFFER_SIZE as isize) },
-            63,
-        )
-    );
-    assert_eq!(
-        0..1,
-        get_range_inner::<LOCAL_BUFFER_SIZE, LOCAL_RING_SIZE>(base, unsafe { base.offset(0) }, 63,)
-    );
-    assert_eq!(
-        0..1,
-        get_range_inner::<LOCAL_BUFFER_SIZE, LOCAL_RING_SIZE>(base, unsafe { base.offset(0) }, 64,)
-    );
+    use crate::{get_range_inner, last_buffer_index};
+
+    #[test]
+    fn last_buffer_tests() {
+        let k = last_buffer_index::<64, 64>(63, 64);
+        assert_eq!(k, 63);
+        let k = last_buffer_index::<64, 64>(0, 64);
+        assert_eq!(k, 0);
+        let k = last_buffer_index::<64, 64>(0, 25);
+        assert_eq!(k, 0);
+        let k = last_buffer_index::<64, 64>(0, 130);
+        assert_eq!(k, 2);
+    }
+
+    #[test]
+    fn get_range_inner_test() {
+        const LOCAL_BUFFER_SIZE: u32 = 64;
+        const LOCAL_RING_SIZE: u16 = 64;
+        let mut arr = [0u8; (LOCAL_BUFFER_SIZE * LOCAL_RING_SIZE as u32) as usize];
+        let base = unsafe { NonNull::new_unchecked(arr.as_mut_ptr()) };
+        assert_eq!(
+            3..4,
+            get_range_inner::<LOCAL_BUFFER_SIZE, LOCAL_RING_SIZE>(
+                base,
+                unsafe { base.offset(3 * LOCAL_BUFFER_SIZE as isize) },
+                63,
+            )
+        );
+        assert_eq!(
+            0..1,
+            get_range_inner::<LOCAL_BUFFER_SIZE, LOCAL_RING_SIZE>(
+                base,
+                unsafe { base.offset(0) },
+                63,
+            )
+        );
+        assert_eq!(
+            0..1,
+            get_range_inner::<LOCAL_BUFFER_SIZE, LOCAL_RING_SIZE>(
+                base,
+                unsafe { base.offset(0) },
+                64,
+            )
+        );
+    }
 }
