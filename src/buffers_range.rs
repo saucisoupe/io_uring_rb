@@ -18,9 +18,9 @@ pub struct BufferRangeInner {
 
 impl BufferRange {
     #[inline]
-    pub fn as_parts<R>(&self, mut f: impl FnMut(&[u8]) -> R) -> (R, Option<R>) {
-        let r1 = f(self.first.as_slice());
-        let r2 = self.second.as_ref().map(|s| f(s.as_slice()));
+    pub fn as_parts(&self) -> (&[u8], Option<&[u8]>) {
+        let r1 = self.first.as_slice();
+        let r2 = self.second.as_ref().map(|s| s.as_slice());
         (r1, r2)
     }
 
