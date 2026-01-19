@@ -93,7 +93,7 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
     }
 
     ///recycles a buffer in the ring, use this only once on a buffer when you are done
-    pub fn recycle_buffer(&self, buffer: Buffer) {
+    pub fn recycle_buffer(&self, buffer: &mut Buffer) {
         let ring = unsafe { &*self.mapped_ring.get() };
 
         unsafe {
@@ -112,7 +112,7 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
     }
 
     /// recycles all buffers in a range back to the ring.
-    pub fn recycle_range_buffer(&self, buffer: BufferRange) {
+    pub fn recycle_range_buffer(&self, buffer: &mut BufferRange) {
         let ring = unsafe { &*self.mapped_ring.get() };
         let pool = unsafe { &*self.buffer_pool.get() };
 
@@ -123,7 +123,7 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
 
             let count = buffer.range.end - buffer.range.start;
 
-            for (i, bid) in buffer.range.enumerate() {
+            for (i, bid) in buffer.range.clone().enumerate() {
                 let idx = (tail.wrapping_add(i as u16) as usize) & (RING_SIZE - 1);
                 let entry = ring_ptr.add(idx);
 

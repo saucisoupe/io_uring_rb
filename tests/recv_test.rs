@@ -52,11 +52,11 @@ fn test_recv_with_buffer_ring() {
                 n if n > 0 => {
                     let flags = cqe.flags();
                     let buffer_id = (flags >> 16) as u16;
-                    let buffer = br.get_buffers_range(buffer_id, bytes_read as _).unwrap();
+                    let mut buffer = br.get_buffers_range(buffer_id, bytes_read as _).unwrap();
 
                     let s = unsafe { str::from_utf8_unchecked(buffer.as_ref()) };
                     received.push_str(s);
-                    br.recycle_range_buffer(buffer);
+                    br.recycle_range_buffer(&mut buffer);
                 }
                 0 => break 'outer,
                 e => panic!("{}", e),
