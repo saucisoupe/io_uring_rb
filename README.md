@@ -1,4 +1,6 @@
 Ring buffer manager for io_uring in *core-per-thread architecture context*, works along with the io-uring crate. I needed different features than the existing crates for my async runtime.
+# WIP
+- wrap-around for RangeBuffer
 
 # conditions
 - linux
