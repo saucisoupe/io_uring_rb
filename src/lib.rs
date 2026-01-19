@@ -2,8 +2,8 @@ use std::{
     cell::UnsafeCell, marker::PhantomData, ops::Range, ptr::NonNull, sync::atomic::Ordering,
 };
 
-mod buffer;
-mod buffer_pool;
+pub mod buffer;
+pub mod buffer_pool;
 mod buffers_range;
 mod mapped_ring;
 
