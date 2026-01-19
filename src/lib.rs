@@ -10,22 +10,22 @@ use io_uring::{IoUring, types::BufRingEntry};
 
 use crate::{buffer_pool::BufferPool, mapped_ring::MmapedRing};
 
-pub struct RingBuffer<const BUFFER_SIZE: usize, const RING_SIZE: usize> {
+type BufferId = u16;
+
+pub struct RingBuffer<const BUFFER_SIZE: u32, const RING_SIZE: u16> {
     buffer_pool: UnsafeCell<BufferPool<BUFFER_SIZE, RING_SIZE>>,
     mapped_ring: UnsafeCell<MmapedRing>,
     id: u16,
 }
 
-impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, RING_SIZE> {
+impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_SIZE> {
     pub fn group_id(&self) -> u16 {
         self.id
     }
 
     pub fn new(ring: &IoUring, flags: u16, buffer_group_id: u16) -> std::io::Result<Self> {
         assert!(BUFFER_SIZE.is_power_of_two());
-        assert!(BUFFER_SIZE <= u32::MAX as usize);
         assert!(RING_SIZE.is_power_of_two());
-        assert!(RING_SIZE <= u16::MAX as usize);
 
         let mut mmaped_ring: MmapedRing = MmapedRing::build(RING_SIZE as _)?;
         let slice = mmaped_ring.as_slice();
@@ -43,9 +43,9 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
 
         for (bid, slot) in slice.iter_mut().enumerate() {
             let entry = slot.write(unsafe { std::mem::zeroed() });
-            entry.set_addr(bp.ptr_for_bid(bid) as _);
+            entry.set_addr(bp.ptr_for_bid(bid as _) as _);
             entry.set_bid(bid as u16);
-            entry.set_len(BUFFER_SIZE as u32);
+            entry.set_len(BUFFER_SIZE);
         }
 
         unsafe {
@@ -61,9 +61,20 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
         })
     }
 
-    pub fn get_buffer(&self, bid: u16, len: usize) -> Option<Buffer> {
+    fn get_pool_base(&self) -> NonNull<u8> {
+        let ring_ptr = unsafe { &*self.buffer_pool.get() };
+        ring_ptr.get(0).unwrap()
+    }
+
+    fn get_range(&self, buff_range: &BufferRangeInner) -> Range<u16> {
+        let BufferRangeInner { ptr, len } = buff_range;
+        let base = self.get_pool_base();
+        get_range_inner::<BUFFER_SIZE, RING_SIZE>(base, *ptr, *len)
+    }
+
+    pub fn get_buffer(&self, bid: BufferId, len: usize) -> Option<Buffer> {
         let inner = unsafe { &*self.buffer_pool.get() };
-        if len > BUFFER_SIZE {
+        if len > BUFFER_SIZE as usize {
             return None;
         }
         inner.get(bid).map(|ptr| Buffer {
@@ -74,22 +85,35 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
         })
     }
 
-    pub fn get_buffers_range(&self, bid_first_buffer: u16, len: usize) -> Option<BufferRange> {
-        let first_buffer = bid_first_buffer as usize;
-        let last_buffer = last_buffer::<BUFFER_SIZE, RING_SIZE>(first_buffer, len);
-        if last_buffer > RING_SIZE {
-            return None;
-        }
+    pub fn get_buffers_range(&self, bid_first_buffer: BufferId, len: usize) -> Option<BufferRange> {
+        let last_buffer = last_buffer_index::<BUFFER_SIZE, RING_SIZE>(bid_first_buffer, len);
         let inner = unsafe { &*self.buffer_pool.get() };
-        if let Some(ptr) = inner.get(bid_first_buffer) {
-            return Some(BufferRange {
-                range: first_buffer as _..last_buffer as _,
+        if last_buffer >= RING_SIZE {
+            let first_len = ((RING_SIZE - bid_first_buffer) as usize) * BUFFER_SIZE as usize;
+            let second_len = len - first_len;
+            if let Some(first) = inner.get(bid_first_buffer).map(|ptr| BufferRangeInner {
                 ptr,
-                len,
+                len: first_len,
+            }) {
+                let second = inner.get(0).map(|ptr| BufferRangeInner {
+                    ptr,
+                    len: second_len,
+                });
+                Some(BufferRange {
+                    first,
+                    second,
+                    _not_send_sync: PhantomData,
+                })
+            } else {
+                None
+            }
+        } else {
+            inner.get(bid_first_buffer).map(|ptr| BufferRange {
+                first: BufferRangeInner { ptr, len },
+                second: None,
                 _not_send_sync: PhantomData,
-            });
+            })
         }
-        None
     }
 
     ///recycles a buffer in the ring, use this only once on a buffer when you are done
@@ -100,61 +124,70 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> RingBuffer<BUFFER_SIZE, R
             let ring_ptr = ring.inner().as_ptr();
             let tail_ptr = BufRingEntry::tail(ring_ptr) as *const std::sync::atomic::AtomicU16;
             let tail = (*tail_ptr).load(Ordering::Acquire);
-            let idx = (tail as usize) & (RING_SIZE - 1);
+            let idx = (tail as usize) & (RING_SIZE - 1) as usize;
             let entry = ring_ptr.add(idx);
 
             (*entry).set_addr(buffer.ptr.as_ptr() as u64);
-            (*entry).set_len(BUFFER_SIZE as u32);
+            (*entry).set_len(BUFFER_SIZE);
             (*entry).set_bid(buffer.bid);
 
             (*tail_ptr).store(tail.wrapping_add(1), Ordering::Release);
         }
     }
 
-    /// recycles all buffers in a range back to the ring.
-    pub fn recycle_range_buffer(&self, buffer: &mut BufferRange) {
+    /// Recycles a range of buffers back to the ring based on ptr and len.
+    /// Updates the atomic tail in one go after setting up all entries.
+    pub fn recycle_inner_range(&self, buffer: &BufferRange) {
         let ring = unsafe { &*self.mapped_ring.get() };
         let pool = unsafe { &*self.buffer_pool.get() };
-
+        let ids_to_free = self.get_range(&buffer.first).chain(
+            buffer
+                .second
+                .as_ref()
+                .map(|b| self.get_range(b))
+                .unwrap_or_default(),
+        );
         unsafe {
             let ring_ptr = ring.inner().as_ptr();
             let tail_ptr = BufRingEntry::tail(ring_ptr) as *const std::sync::atomic::AtomicU16;
             let tail = (*tail_ptr).load(Ordering::Acquire);
 
-            let count = buffer.range.end - buffer.range.start;
-
-            for (i, bid) in buffer.range.clone().enumerate() {
-                let idx = (tail.wrapping_add(i as u16) as usize) & (RING_SIZE - 1);
+            let mut len = 0;
+            for (i, bid) in ids_to_free.enumerate() {
+                let idx = (tail.wrapping_add(i as u16) as usize) & ((RING_SIZE - 1) as usize);
                 let entry = ring_ptr.add(idx);
 
-                let ptr = pool.ptr_for_bid(bid as usize);
+                let ptr = pool.ptr_for_bid(bid);
                 (*entry).set_addr(ptr as u64);
-                (*entry).set_len(BUFFER_SIZE as u32);
+                (*entry).set_len(BUFFER_SIZE);
                 (*entry).set_bid(bid);
+                len += 1;
             }
-
-            (*tail_ptr).store(tail.wrapping_add(count), Ordering::Release);
+            let new_tail = tail.wrapping_add(len);
+            std::sync::atomic::fence(Ordering::Release);
+            (*tail_ptr).store(new_tail, Ordering::Release);
         }
     }
 }
 
 /// this buffer represents an immutable slice over multiple contiguous underlying buffers, recycle it when you are done. Made for Bundled Recv
 /// not automatically returned on Drop.
+#[derive(Debug)]
 pub struct BufferRange {
-    ptr: NonNull<u8>,
-    len: usize,
-    range: Range<u16>,
+    first: BufferRangeInner,
+    second: Option<BufferRangeInner>,
     _not_send_sync: PhantomData<*const ()>,
 }
 
-impl BufferRange {
-    pub fn range(&self) -> Range<u16> {
-        self.range.clone()
-    }
+#[derive(Debug)]
+pub struct BufferRangeInner {
+    ptr: NonNull<u8>,
+    len: usize,
 }
 
 /// this buffer represents an immutable slice in a buffer, recycle it when you are done.
 /// not automatically returned on Drop.
+#[derive(Debug)]
 pub struct Buffer {
     ptr: NonNull<u8>,
     len: usize,
@@ -174,17 +207,82 @@ impl AsRef<[u8]> for Buffer {
     }
 }
 
-impl AsRef<[u8]> for BufferRange {
-    fn as_ref(&self) -> &[u8] {
+impl BufferRange {
+    #[inline]
+    pub fn as_parts<R>(&self, mut f: impl FnMut(&[u8]) -> R) -> (R, Option<R>) {
+        let r1 = f(self.first.as_slice());
+        let r2 = self.second.as_ref().map(|s| f(s.as_slice()));
+        (r1, r2)
+    }
+
+    pub fn as_iterator(&self) -> impl Iterator<Item = &u8> {
+        self.first
+            .as_slice()
+            .iter()
+            .chain(self.second.iter().flat_map(|s| s.as_slice()))
+    }
+}
+
+impl BufferRangeInner {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
 
 ///gets the id of the last buffer of a range, starting at bid
 #[inline(always)]
-fn last_buffer<const BUFFER_SIZE: usize, const RING_SIZE: usize>(
-    bid: usize,
+fn last_buffer_index<const BUFFER_SIZE: u32, const RING_SIZE: u16>(
+    bid: u16,
     total_len: usize,
-) -> usize {
-    bid + total_len.div_ceil(BUFFER_SIZE)
+) -> u16 {
+    bid + (total_len as u32).div_ceil(BUFFER_SIZE) as u16 - 1
+}
+
+fn get_range_inner<const BUFFER_SIZE: u32, const RING_SIZE: u16>(
+    base: NonNull<u8>,
+    ptr: NonNull<u8>,
+    len: usize,
+) -> Range<u16> {
+    let offset = unsafe { ptr.offset_from(base) };
+    assert!(offset >= 0);
+    let start = (offset as u32 / BUFFER_SIZE) as u16;
+    let end = last_buffer_index::<BUFFER_SIZE, RING_SIZE>(start, len) + 1;
+    start..end
+}
+
+#[test]
+fn last_buffer_tests() {
+    let k = last_buffer_index::<64, 64>(63, 64);
+    assert_eq!(k, 63);
+    let k = last_buffer_index::<64, 64>(0, 64);
+    assert_eq!(k, 0);
+    let k = last_buffer_index::<64, 64>(0, 25);
+    assert_eq!(k, 0);
+    let k = last_buffer_index::<64, 64>(0, 130);
+    assert_eq!(k, 2);
+}
+
+#[test]
+fn get_range_inner_test() {
+    const LOCAL_BUFFER_SIZE: u32 = 64;
+    const LOCAL_RING_SIZE: u16 = 64;
+    let mut arr = [0u8; (LOCAL_BUFFER_SIZE * LOCAL_RING_SIZE as u32) as usize];
+    let base = unsafe { NonNull::new_unchecked(arr.as_mut_ptr()) };
+    assert_eq!(
+        3..4,
+        get_range_inner::<LOCAL_BUFFER_SIZE, LOCAL_RING_SIZE>(
+            base,
+            unsafe { base.offset(3 * LOCAL_BUFFER_SIZE as isize) },
+            63,
+        )
+    );
+    assert_eq!(
+        0..1,
+        get_range_inner::<LOCAL_BUFFER_SIZE, LOCAL_RING_SIZE>(base, unsafe { base.offset(0) }, 63,)
+    );
+    assert_eq!(
+        0..1,
+        get_range_inner::<LOCAL_BUFFER_SIZE, LOCAL_RING_SIZE>(base, unsafe { base.offset(0) }, 64,)
+    );
 }

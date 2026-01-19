@@ -1,3 +1,4 @@
+use core::panic;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
@@ -9,12 +10,19 @@ use io_uring::squeue::Flags;
 use io_uring::types::Fd;
 use io_uring_rb::RingBuffer;
 
-const TEXT: &str = "Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet, consectetur, adipisci velit, sed quia non numquam eius modi tempora incidunt ut labore et dolore magnam aliquam quaerat voluptatem. Ut enim ad minima veniam, quis nostrum exercitationem ullam corporis suscipit laboriosam, nisi ut aliquid ex ea commodi consequatur? Quis autem vel eum iure reprehenderit qui in ea voluptate velit esse quam nihil molestiae consequatur, vel illum qui dolorem eum fugiat quo voluptas nulla pariatur?";
+use crate::tools::RandomChunkIterator;
 
 #[test]
 fn test_recv_with_buffer_ring() {
-    const BUFFER_SIZE: usize = 4;
-    const SIZE: usize = 4;
+    let mut random_bytes = vec![0u8; 16_000_000];
+    for (i, chunk) in random_bytes.chunks_mut(4).enumerate() {
+        let idx = (i as u32).to_le_bytes();
+        chunk.copy_from_slice(&idx);
+    }
+    let random_bytes_clone = random_bytes.clone();
+
+    const BUFFER_SIZE: u32 = 1024;
+    const SIZE: u16 = 1024;
     const BGID: u16 = 0;
 
     let mut ring = io_uring::IoUring::new(64).unwrap();
@@ -26,12 +34,12 @@ fn test_recv_with_buffer_ring() {
 
     let handle = thread::spawn(move || {
         let mut client = TcpStream::connect(addr).unwrap();
-        for i in TEXT.as_bytes().chunks(32) {
-            client.write_all(i).unwrap();
-            client.flush().unwrap();
+        let it = RandomChunkIterator::new(&random_bytes, 1, 4096);
+        for chunk in it {
+            client.write_all(chunk).unwrap();
         }
     });
-    let mut received = String::new();
+    let mut received = Vec::<u8>::new();
     let (server, _) = listener.accept().unwrap();
     server.set_nonblocking(true).unwrap();
     sleep(Duration::from_millis(200));
@@ -39,30 +47,94 @@ fn test_recv_with_buffer_ring() {
         .build()
         .flags(Flags::BUFFER_SELECT)
         .user_data(0x42);
-
+    unsafe {
+        ring.submission().push(&recv_entry).unwrap();
+    }
+    ring.submit().unwrap();
+    let mut need_resubmit = false;
     'outer: loop {
-        unsafe {
-            ring.submission().push(&recv_entry).unwrap();
+        if need_resubmit {
+            unsafe {
+                ring.submission().push(&recv_entry).unwrap();
+            }
+            need_resubmit = false;
         }
         ring.submit_and_wait(1).unwrap();
 
-        for cqe in ring.completion() {
-            let bytes_read = cqe.result();
+        // Collect CQEs first to avoid borrow issues
+        let cqes: Vec<_> = ring
+            .completion()
+            .map(|cqe| (cqe.result(), cqe.flags()))
+            .collect();
+
+        for (bytes_read, flags) in cqes {
             match bytes_read {
                 n if n > 0 => {
-                    let flags = cqe.flags();
                     let buffer_id = (flags >> 16) as u16;
-                    let mut buffer = br.get_buffers_range(buffer_id, bytes_read as _).unwrap();
-
-                    let s = unsafe { str::from_utf8_unchecked(buffer.as_ref()) };
-                    received.push_str(s);
-                    br.recycle_range_buffer(&mut buffer);
+                    let buf_more = (flags & 0x08) != 0; // IORING_CQE_F_BUF_MORE
+                    let buffer = br.get_buffers_range(buffer_id, n as _).unwrap();
+                    let data = buffer.as_iterator();
+                    received.extend(data);
+                    br.recycle_inner_range(&buffer);
+                    if !buf_more {
+                        need_resubmit = true;
+                    }
                 }
                 0 => break 'outer,
+                -105 => {
+                    need_resubmit = true;
+                }
                 e => panic!("{}", e),
             }
         }
+        ring.submit().unwrap();
     }
+
     handle.join().unwrap();
-    assert_eq!(received, TEXT);
+    assert_eq!(random_bytes_clone.len(), received.len());
+    assert_eq!(random_bytes_clone, received);
+}
+
+pub mod tools {
+
+    use rand::Rng;
+    use rand::rngs::ThreadRng;
+
+    pub struct RandomChunkIterator<'a> {
+        data: &'a [u8],
+        rng: ThreadRng,
+        min_chunk: usize,
+        max_chunk: usize,
+        current_pos: usize,
+    }
+
+    impl<'a> RandomChunkIterator<'a> {
+        pub fn new(data: &'a [u8], min_chunk: usize, max_chunk: usize) -> Self {
+            Self {
+                data,
+                rng: rand::rng(),
+                min_chunk,
+                max_chunk,
+                current_pos: 0,
+            }
+        }
+    }
+
+    impl<'a> Iterator for RandomChunkIterator<'a> {
+        type Item = &'a [u8];
+
+        fn next(&mut self) -> Option<Self::Item> {
+            // If we've reached the end, stop iterating
+            if self.current_pos >= self.data.len() {
+                return None;
+            }
+
+            let chunk_size = self.rng.random_range(self.min_chunk..=self.max_chunk);
+            let end = (self.current_pos + chunk_size).min(self.data.len());
+            let chunk = &self.data[self.current_pos..end];
+            self.current_pos = end;
+
+            Some(chunk)
+        }
+    }
 }

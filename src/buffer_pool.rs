@@ -2,13 +2,15 @@ use std::ptr::{NonNull, null_mut};
 
 use rustix::mm::{MapFlags, ProtFlags, mmap_anonymous};
 
-pub struct BufferPool<const BUFFER_SIZE: usize, const RING_SIZE: usize> {
+use crate::BufferId;
+
+pub struct BufferPool<const BUFFER_SIZE: u32, const RING_SIZE: u16> {
     ptr: *mut u8,
 }
 
-impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> BufferPool<BUFFER_SIZE, RING_SIZE> {
+impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> BufferPool<BUFFER_SIZE, RING_SIZE> {
     pub fn new() -> std::io::Result<Self> {
-        let total_size = BUFFER_SIZE * RING_SIZE;
+        let total_size = (BUFFER_SIZE * RING_SIZE as u32) as usize;
         let ptr = unsafe {
             mmap_anonymous(
                 null_mut(),
@@ -22,25 +24,25 @@ impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> BufferPool<BUFFER_SIZE, R
 
     ///gets the pointer to the buffer of index bid (read-only)
     pub fn get(&self, bid: u16) -> Option<NonNull<u8>> {
-        let id = bid as usize;
-        if id >= RING_SIZE {
+        if bid >= RING_SIZE {
             return None;
         }
-        let ptr = unsafe { self.ptr.add(BUFFER_SIZE * id) };
+        let ptr = unsafe { self.ptr.add((BUFFER_SIZE * bid as u32) as _) };
         NonNull::new(ptr)
     }
 
     ///for building purpose
-    pub(crate) fn ptr_for_bid(&self, bid: usize) -> *mut u8 {
+    pub(crate) fn ptr_for_bid(&self, bid: BufferId) -> *mut u8 {
         assert!(bid < RING_SIZE);
-        unsafe { self.ptr.add(bid * BUFFER_SIZE) }
+        unsafe { self.ptr.add((bid as u32 * BUFFER_SIZE) as usize) }
     }
 }
 
-impl<const BUFFER_SIZE: usize, const RING_SIZE: usize> Drop for BufferPool<BUFFER_SIZE, RING_SIZE> {
+impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> Drop for BufferPool<BUFFER_SIZE, RING_SIZE> {
     fn drop(&mut self) {
         unsafe {
-            let _ = rustix::mm::munmap(self.ptr.cast(), BUFFER_SIZE * RING_SIZE);
+            let _ =
+                rustix::mm::munmap(self.ptr.cast(), (BUFFER_SIZE * (RING_SIZE as u32)) as usize);
         }
     }
 }
