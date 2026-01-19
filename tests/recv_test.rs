@@ -17,17 +17,12 @@ fn test_recv_with_buffer_ring() {
     const SIZE: usize = 4;
     const BGID: u16 = 0;
 
-    // Create io_uring
     let mut ring = io_uring::IoUring::new(64).unwrap();
 
-    // Create buffer ring: 4 buffers of 4 bytes = 16 bytes total
     let br = RingBuffer::<BUFFER_SIZE, SIZE>::new(&ring, 0, BGID).unwrap();
 
-    // Create a TCP listener and connect
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-
-    // Submit recv with provided buffer selection
 
     let handle = thread::spawn(move || {
         let mut client = TcpStream::connect(addr).unwrap();
@@ -36,7 +31,7 @@ fn test_recv_with_buffer_ring() {
             client.flush().unwrap();
         }
     });
-    let mut t = String::new();
+    let mut received = String::new();
     let (server, _) = listener.accept().unwrap();
     server.set_nonblocking(true).unwrap();
     sleep(Duration::from_millis(200));
@@ -60,7 +55,7 @@ fn test_recv_with_buffer_ring() {
                     let buffer = br.get_buffers_range(buffer_id, bytes_read as _).unwrap();
 
                     let s = unsafe { str::from_utf8_unchecked(buffer.as_ref()) };
-                    t.push_str(s);
+                    received.push_str(s);
                     br.recycle_range_buffer(buffer);
                 }
                 0 => break 'outer,
@@ -69,5 +64,5 @@ fn test_recv_with_buffer_ring() {
         }
     }
     handle.join().unwrap();
-    assert_eq!(t, TEXT);
+    assert_eq!(received, TEXT);
 }
