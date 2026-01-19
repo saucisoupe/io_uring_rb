@@ -3,8 +3,8 @@ use std::{
 };
 
 pub mod buffer;
-pub mod buffer_pool;
-mod buffers_range;
+mod buffer_pool;
+pub mod buffers_range;
 mod mapped_ring;
 
 use io_uring::{IoUring, types::BufRingEntry};
