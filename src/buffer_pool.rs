@@ -22,19 +22,23 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> BufferPool<BUFFER_SIZE, RING_
         Ok(Self { ptr: ptr.cast() })
     }
 
+    /// Returns the pointer offset for a given buffer id
+    fn buffer_offset(&self, bid: u16) -> *mut u8 {
+        unsafe { self.ptr.add((bid as u32 * BUFFER_SIZE) as usize) }
+    }
+
     ///gets the pointer to the buffer of index bid (read-only)
     pub fn get(&self, bid: u16) -> Option<NonNull<u8>> {
         if bid >= RING_SIZE {
             return None;
         }
-        let ptr = unsafe { self.ptr.add((BUFFER_SIZE * bid as u32) as _) };
-        NonNull::new(ptr)
+        NonNull::new(self.buffer_offset(bid))
     }
 
     ///for building purpose
     pub(crate) fn ptr_for_bid(&self, bid: BufferId) -> *mut u8 {
         assert!(bid < RING_SIZE);
-        unsafe { self.ptr.add((bid as u32 * BUFFER_SIZE) as usize) }
+        self.buffer_offset(bid)
     }
 }
 

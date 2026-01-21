@@ -18,6 +18,38 @@ use crate::{
 
 type BufferId = u16;
 
+/// Helper to get the current tail value from a ring buffer
+unsafe fn get_tail(ring_ptr: *const BufRingEntry) -> u16 {
+    unsafe {
+        let tail_ptr = BufRingEntry::tail(ring_ptr) as *const std::sync::atomic::AtomicU16;
+        (*tail_ptr).load(Ordering::Acquire)
+    }
+}
+
+/// Helper to set the tail value on a ring buffer
+unsafe fn set_tail(ring_ptr: *const BufRingEntry, new_tail: u16) {
+    unsafe {
+        let tail_ptr = BufRingEntry::tail(ring_ptr) as *const std::sync::atomic::AtomicU16;
+        (*tail_ptr).store(new_tail, Ordering::Release);
+    }
+}
+
+/// Sets up a ring entry at the given tail position
+unsafe fn setup_ring_entry<const BUFFER_SIZE: u32, const RING_SIZE: u16>(
+    ring_ptr: *mut BufRingEntry,
+    tail: u16,
+    addr: u64,
+    bid: u16,
+) {
+    unsafe {
+        let idx = (tail as usize) & ((RING_SIZE - 1) as usize);
+        let entry = ring_ptr.add(idx);
+        (*entry).set_addr(addr);
+        (*entry).set_len(BUFFER_SIZE);
+        (*entry).set_bid(bid);
+    }
+}
+
 pub struct RingBuffer<const BUFFER_SIZE: u32, const RING_SIZE: u16> {
     buffer_pool: UnsafeCell<BufferPool<BUFFER_SIZE, RING_SIZE>>,
     mapped_ring: UnsafeCell<MmapedRing>,
@@ -55,9 +87,7 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
         }
 
         unsafe {
-            let tail = BufRingEntry::tail(slice.as_ptr() as *const BufRingEntry)
-                as *const std::sync::atomic::AtomicU16;
-            (*tail).store(RING_SIZE as _, Ordering::Release);
+            set_tail(slice.as_ptr() as *const BufRingEntry, RING_SIZE);
         }
 
         Ok(RingBuffer {
@@ -128,16 +158,14 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
 
         unsafe {
             let ring_ptr = ring.inner().as_ptr();
-            let tail_ptr = BufRingEntry::tail(ring_ptr) as *const std::sync::atomic::AtomicU16;
-            let tail = (*tail_ptr).load(Ordering::Acquire);
-            let idx = (tail as usize) & (RING_SIZE - 1) as usize;
-            let entry = ring_ptr.add(idx);
-
-            (*entry).set_addr(buffer.ptr.as_ptr() as u64);
-            (*entry).set_len(BUFFER_SIZE);
-            (*entry).set_bid(buffer.bid);
-
-            (*tail_ptr).store(tail.wrapping_add(1), Ordering::Release);
+            let tail = get_tail(ring_ptr);
+            setup_ring_entry::<BUFFER_SIZE, RING_SIZE>(
+                ring_ptr,
+                tail,
+                buffer.ptr.as_ptr() as u64,
+                buffer.bid,
+            );
+            set_tail(ring_ptr, tail.wrapping_add(1));
         }
     }
 
@@ -155,23 +183,21 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
         );
         unsafe {
             let ring_ptr = ring.inner().as_ptr();
-            let tail_ptr = BufRingEntry::tail(ring_ptr) as *const std::sync::atomic::AtomicU16;
-            let tail = (*tail_ptr).load(Ordering::Acquire);
+            let tail = get_tail(ring_ptr);
 
-            let mut len = 0;
+            let mut count = 0u16;
             for (i, bid) in ids_to_free.enumerate() {
-                let idx = (tail.wrapping_add(i as u16) as usize) & ((RING_SIZE - 1) as usize);
-                let entry = ring_ptr.add(idx);
-
                 let ptr = pool.ptr_for_bid(bid);
-                (*entry).set_addr(ptr as u64);
-                (*entry).set_len(BUFFER_SIZE);
-                (*entry).set_bid(bid);
-                len += 1;
+                setup_ring_entry::<BUFFER_SIZE, RING_SIZE>(
+                    ring_ptr,
+                    tail.wrapping_add(i as u16),
+                    ptr as u64,
+                    bid,
+                );
+                count += 1;
             }
-            let new_tail = tail.wrapping_add(len);
             std::sync::atomic::fence(Ordering::Release);
-            (*tail_ptr).store(new_tail, Ordering::Release);
+            set_tail(ring_ptr, tail.wrapping_add(count));
         }
     }
 }
