@@ -6,7 +6,6 @@ use std::thread::{self, sleep};
 use std::time::Duration;
 
 use io_uring::opcode;
-use io_uring::squeue::Flags;
 use io_uring::types::Fd;
 use io_uring_rb::RingBuffer;
 
@@ -14,7 +13,7 @@ use crate::tools::RandomChunkIterator;
 
 #[test]
 fn test_recv_with_buffer_ring() {
-    let mut random_bytes = vec![0u8; 16_000_000];
+    let mut random_bytes = vec![0u8; 100_000_000];
     for (i, chunk) in random_bytes.chunks_mut(4).enumerate() {
         let idx = (i as u32).to_le_bytes();
         chunk.copy_from_slice(&idx);
@@ -43,9 +42,8 @@ fn test_recv_with_buffer_ring() {
     let (server, _) = listener.accept().unwrap();
     server.set_nonblocking(true).unwrap();
     sleep(Duration::from_millis(200));
-    let recv_entry = opcode::RecvMultiBundle::new(Fd(server.as_raw_fd()), 0)
+    let recv_entry = opcode::RecvMulti::new(Fd(server.as_raw_fd()), 0)
         .build()
-        .flags(Flags::BUFFER_SELECT)
         .user_data(0x42);
     unsafe {
         ring.submission().push(&recv_entry).unwrap();
@@ -72,10 +70,9 @@ fn test_recv_with_buffer_ring() {
                 n if n > 0 => {
                     let buffer_id = (flags >> 16) as u16;
                     let buf_more = (flags & 0x08) != 0; // IORING_CQE_F_BUF_MORE
-                    let buffer = br.get_buffers_range(buffer_id, n as _).unwrap();
-                    let data = buffer.as_iterator();
-                    received.extend(data);
-                    br.recycle_inner_range(&buffer);
+                    let buffer = br.get_buffer(buffer_id, n as _).unwrap();
+                    received.extend(buffer.as_ref());
+                    br.recycle_buffer(&buffer);
                     if !buf_more {
                         need_resubmit = true;
                     }
