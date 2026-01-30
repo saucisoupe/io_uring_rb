@@ -22,3 +22,9 @@ impl AsRef<[u8]> for Buffer {
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
+
+impl AsMut<[u8]> for Buffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
