@@ -89,7 +89,7 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
         })
     }
 
-    pub fn get_buffer(&self, bid: BufferId, len: usize) -> Option<Buffer> {
+    pub fn get_buffer(&self, bid: BufferId, len: usize) -> Option<Buffer<BUFFER_SIZE>> {
         let inner = unsafe { &*self.buffer_pool.get() };
         if len > BUFFER_SIZE as usize {
             return None;
@@ -102,7 +102,7 @@ impl<const BUFFER_SIZE: u32, const RING_SIZE: u16> RingBuffer<BUFFER_SIZE, RING_
         })
     }
     ///recycles a buffer in the ring, use this only once on a buffer when you are done
-    pub fn recycle_buffer(&self, buffer: &Buffer) {
+    pub fn recycle_buffer(&self, buffer: &Buffer<BUFFER_SIZE>) {
         let ring = unsafe { &*self.mapped_ring.get() };
 
         unsafe {
